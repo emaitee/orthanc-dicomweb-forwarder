@@ -1,0 +1,13 @@
+{
+  "name": "orthanc-dicomweb-forwarder",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "1.7.2",
+    "dotenv": "16.4.5",
+    "form-data": "4.0.0"
+  }
+}
