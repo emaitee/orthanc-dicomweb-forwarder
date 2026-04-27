@@ -58,13 +58,16 @@ async function forwardInstance(instanceId) {
     const { data: tags } = await ORTHANC.get(`/instances/${instanceId}/tags?simplify`);
     
     console.log(`\n📋 Processing instance: ${instanceId}`);
-    console.log(`   Transfer Syntax: ${tags.TransferSyntaxUID || 'Unknown'}`);
+    console.log(`   Transfer Syntax: ${tags.TransferSyntaxUID || 'Missing/Unknown'}`);
     console.log(`   Dimensions: ${tags.Rows}x${tags.Columns}`);
     console.log(`   Photometric: ${tags.PhotometricInterpretation || 'Unknown'}`);
+    console.log(`   Bits Allocated: ${tags.BitsAllocated}`);
+    console.log(`   Samples Per Pixel: ${tags.SamplesPerPixel}`);
+    console.log(`   Planar Configuration: ${tags.PlanarConfiguration !== undefined ? tags.PlanarConfiguration : 'Not set'}`);
     
     // Get the DICOM file - try to get uncompressed version
     let dicomBuffer;
-    const transferSyntax = tags.TransferSyntaxUID;
+    const transferSyntax = tags.TransferSyntaxUID || '';
     
     // List of compressed transfer syntaxes that might cause issues
     const compressedSyntaxes = [
@@ -79,9 +82,15 @@ async function forwardInstance(instanceId) {
       '1.2.840.10008.1.2.5',     // RLE Lossless
     ];
     
-    // If compressed, try to get uncompressed version from Orthanc
-    if (compressedSyntaxes.includes(transferSyntax)) {
-      console.log(`   ⚙️  Transcoding compressed image to uncompressed...`);
+    // For RGB images or missing transfer syntax, always transcode to ensure compatibility
+    const needsTranscode = compressedSyntaxes.includes(transferSyntax) || 
+                          !transferSyntax || 
+                          tags.PhotometricInterpretation === 'RGB' ||
+                          tags.PhotometricInterpretation === 'YBR_FULL' ||
+                          tags.PhotometricInterpretation === 'YBR_FULL_422';
+    
+    if (needsTranscode) {
+      console.log(`   ⚙️  Transcoding to standard format (Explicit VR Little Endian)...`);
       try {
         // Request uncompressed transfer syntax (Explicit VR Little Endian)
         const { data } = await ORTHANC.post(
@@ -92,9 +101,40 @@ async function forwardInstance(instanceId) {
         dicomBuffer = Buffer.from(data);
         console.log(`   ✓ Transcoded successfully`);
       } catch (transcodeErr) {
-        console.log(`   ⚠️  Transcoding failed, using original: ${transcodeErr.message}`);
-        const { data } = await ORTHANC.get(`/instances/${instanceId}/file`, { responseType: 'arraybuffer' });
-        dicomBuffer = Buffer.from(data);
+        console.log(`   ⚠️  Transcoding failed: ${transcodeErr.message}`);
+        console.log(`   Trying alternative method...`);
+        
+        // Try using Orthanc's modify endpoint to ensure proper encoding
+        try {
+          // For RGB images, ensure PlanarConfiguration is set to 0 (interleaved)
+          const modifyPayload = {
+            Replace: {},
+            Force: true,
+            Transcode: '1.2.840.10008.1.2.1'
+          };
+          
+          // If RGB and PlanarConfiguration is not 0, force it to 0
+          if (tags.PhotometricInterpretation === 'RGB' && tags.PlanarConfiguration !== 0) {
+            console.log(`   ⚙️  Forcing PlanarConfiguration to 0 (interleaved) for RGB image`);
+            modifyPayload.Replace.PlanarConfiguration = '0';
+          }
+          
+          const { data: modifiedId } = await ORTHANC.post(
+            `/instances/${instanceId}/modify`,
+            modifyPayload
+          );
+          
+          const { data } = await ORTHANC.get(`/instances/${modifiedId.ID}/file`, { responseType: 'arraybuffer' });
+          dicomBuffer = Buffer.from(data);
+          
+          // Clean up the temporary modified instance
+          await ORTHANC.delete(`/instances/${modifiedId.ID}`);
+          console.log(`   ✓ Re-encoded successfully`);
+        } catch (modifyErr) {
+          console.log(`   ⚠️  Re-encoding also failed, using original: ${modifyErr.message}`);
+          const { data } = await ORTHANC.get(`/instances/${instanceId}/file`, { responseType: 'arraybuffer' });
+          dicomBuffer = Buffer.from(data);
+        }
       }
     } else {
       // Already uncompressed or unknown, use as-is
