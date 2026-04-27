@@ -1,0 +1,23 @@
+{
+  "DicomAlwaysAllowStore" : true,
+
+  // Add these DICOMweb configuration sections ONCE (remove duplicates)
+  "DicomWeb": {
+    "Enable": true,
+    "Root": "/dicom-web/",
+    "EnableWado": true,
+    "WadoRoot": "/wado",
+    "Ssl": false,
+    "StowMaxInstances": 10,
+    "StowMaxSize": 10
+  },
+
+  "DicomWebServers": {
+    "remote-server": {
+      "Url": "https://api.oumchealth.org/dicom/",
+      "HasDelete": false
+    }
+  },
+
+  "DicomAlwaysAllowFind" : false
+}
