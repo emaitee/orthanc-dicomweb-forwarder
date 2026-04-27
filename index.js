@@ -2,7 +2,8 @@ require('dotenv').config();
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
-const dicomParser = require('dicom-parser');
+const dcmjs = require('dcmjs');
+const { DicomMetaDictionary, DicomDict } = dcmjs.data;
 
 const ORTHANC = axios.create({
   baseURL: process.env.ORTHANC_URL,
@@ -21,40 +22,9 @@ function saveLastChange(seq) {
   fs.writeFileSync(STATE_FILE, String(seq));
 }
 
-function validateDicomDimensions(dataSet) {
-  try {
-    const rows = dataSet.uint16('x00280010'); // Rows
-    const cols = dataSet.uint16('x00280011'); // Columns
-    const samplesPerPixel = dataSet.uint16('x00280002') || 1; // Samples per Pixel
-    const bitsAllocated = dataSet.uint16('x00280100'); // Bits Allocated
-    const pixelDataElement = dataSet.elements.x7fe00010;
-    
-    if (!pixelDataElement) {
-      throw new Error('No pixel data found');
-    }
-    
-    const pixelDataLength = pixelDataElement.length;
-    const expectedSize = rows * cols * samplesPerPixel * (bitsAllocated / 8);
-    
-    console.log(`DICOM validation: ${rows}x${cols}, ${samplesPerPixel} samples, ${bitsAllocated} bits`);
-    console.log(`Pixel data: ${pixelDataLength} bytes, expected: ${expectedSize} bytes`);
-    
-    // Check if dimensions match
-    if (Math.abs(pixelDataLength - expectedSize) > 1) {
-      console.warn(`⚠️  Pixel data size mismatch! This may cause rendering issues.`);
-      return false;
-    }
-    
-    return true;
-  } catch (err) {
-    console.error('Validation error:', err.message);
-    return false;
-  }
-}
-
 async function forwardInstance(instanceId) {
   try {
-    // First, check if we need to transcode the image
+    // Get instance metadata
     const { data: tags } = await ORTHANC.get(`/instances/${instanceId}/tags?simplify`);
     
     console.log(`\n📋 Processing instance: ${instanceId}`);
@@ -65,92 +35,77 @@ async function forwardInstance(instanceId) {
     console.log(`   Samples Per Pixel: ${tags.SamplesPerPixel}`);
     console.log(`   Planar Configuration: ${tags.PlanarConfiguration !== undefined ? tags.PlanarConfiguration : 'Not set'}`);
     
-    // Get the DICOM file - try to get uncompressed version
-    let dicomBuffer;
-    const transferSyntax = tags.TransferSyntaxUID || '';
+    // Get the original DICOM file
+    const { data: originalData } = await ORTHANC.get(`/instances/${instanceId}/file`, { responseType: 'arraybuffer' });
+    let dicomBuffer = Buffer.from(originalData);
     
-    // List of compressed transfer syntaxes that might cause issues
-    const compressedSyntaxes = [
-      '1.2.840.10008.1.2.4.50',  // JPEG Baseline
-      '1.2.840.10008.1.2.4.51',  // JPEG Extended
-      '1.2.840.10008.1.2.4.57',  // JPEG Lossless
-      '1.2.840.10008.1.2.4.70',  // JPEG Lossless First Order
-      '1.2.840.10008.1.2.4.80',  // JPEG-LS Lossless
-      '1.2.840.10008.1.2.4.81',  // JPEG-LS Lossy
-      '1.2.840.10008.1.2.4.90',  // JPEG 2000 Lossless
-      '1.2.840.10008.1.2.4.91',  // JPEG 2000
-      '1.2.840.10008.1.2.5',     // RLE Lossless
-    ];
-    
-    // For RGB images or missing transfer syntax, always transcode to ensure compatibility
-    const needsTranscode = compressedSyntaxes.includes(transferSyntax) || 
-                          !transferSyntax || 
-                          tags.PhotometricInterpretation === 'RGB' ||
-                          tags.PhotometricInterpretation === 'YBR_FULL' ||
-                          tags.PhotometricInterpretation === 'YBR_FULL_422';
-    
-    if (needsTranscode) {
-      console.log(`   ⚙️  Transcoding to standard format (Explicit VR Little Endian)...`);
+    // If Transfer Syntax is missing, we need to add it
+    if (!tags.TransferSyntaxUID || tags.TransferSyntaxUID === 'Unknown') {
+      console.log(`   ⚙️  Adding missing Transfer Syntax UID...`);
+      
       try {
-        // Request uncompressed transfer syntax (Explicit VR Little Endian)
-        const { data } = await ORTHANC.post(
-          `/instances/${instanceId}/export`,
-          { Transcode: '1.2.840.10008.1.2.1' }, // Explicit VR Little Endian
-          { responseType: 'arraybuffer' }
-        );
-        dicomBuffer = Buffer.from(data);
-        console.log(`   ✓ Transcoded successfully`);
-      } catch (transcodeErr) {
-        console.log(`   ⚠️  Transcoding failed: ${transcodeErr.message}`);
-        console.log(`   Trying alternative method...`);
+        // Parse the DICOM file
+        const dicomData = dcmjs.data.DicomMessage.readFile(dicomBuffer.buffer);
+        const dataset = dcmjs.data.DicomMetaDictionary.naturalizeDataset(dicomData.dict);
         
-        // Try using Orthanc's modify endpoint to ensure proper encoding
-        try {
-          // For RGB images, ensure PlanarConfiguration is set to 0 (interleaved)
-          const modifyPayload = {
-            Replace: {},
-            Force: true,
-            Transcode: '1.2.840.10008.1.2.1'
-          };
-          
-          // If RGB and PlanarConfiguration is not 0, force it to 0
-          if (tags.PhotometricInterpretation === 'RGB' && tags.PlanarConfiguration !== 0) {
-            console.log(`   ⚙️  Forcing PlanarConfiguration to 0 (interleaved) for RGB image`);
-            modifyPayload.Replace.PlanarConfiguration = '0';
-          }
-          
-          const { data: modifiedId } = await ORTHANC.post(
-            `/instances/${instanceId}/modify`,
-            modifyPayload
-          );
-          
-          const { data } = await ORTHANC.get(`/instances/${modifiedId.ID}/file`, { responseType: 'arraybuffer' });
-          dicomBuffer = Buffer.from(data);
-          
-          // Clean up the temporary modified instance
-          await ORTHANC.delete(`/instances/${modifiedId.ID}`);
-          console.log(`   ✓ Re-encoded successfully`);
-        } catch (modifyErr) {
-          console.log(`   ⚠️  Re-encoding also failed, using original: ${modifyErr.message}`);
-          const { data } = await ORTHANC.get(`/instances/${instanceId}/file`, { responseType: 'arraybuffer' });
-          dicomBuffer = Buffer.from(data);
+        // Determine appropriate Transfer Syntax based on image characteristics
+        let transferSyntaxUID;
+        
+        if (tags.PhotometricInterpretation === 'RGB' || tags.SamplesPerPixel === 3) {
+          // RGB images - use Explicit VR Little Endian
+          transferSyntaxUID = '1.2.840.10008.1.2.1';
+          console.log(`   Setting Transfer Syntax to Explicit VR Little Endian (RGB)`);
+        } else if (tags.BitsAllocated === 8) {
+          // 8-bit grayscale - Explicit VR Little Endian
+          transferSyntaxUID = '1.2.840.10008.1.2.1';
+          console.log(`   Setting Transfer Syntax to Explicit VR Little Endian (8-bit)`);
+        } else {
+          // Default to Explicit VR Little Endian
+          transferSyntaxUID = '1.2.840.10008.1.2.1';
+          console.log(`   Setting Transfer Syntax to Explicit VR Little Endian (default)`);
         }
+        
+        // Add/update the Transfer Syntax UID in the meta information
+        if (!dataset._meta) {
+          dataset._meta = {};
+        }
+        dataset._meta.TransferSyntaxUID = { Value: [transferSyntaxUID], vr: 'UI' };
+        
+        // Ensure other required meta information elements are present
+        if (!dataset._meta.FileMetaInformationVersion) {
+          dataset._meta.FileMetaInformationVersion = { Value: [new Uint8Array([0, 1]).buffer], vr: 'OB' };
+        }
+        if (!dataset._meta.MediaStorageSOPClassUID && dataset.SOPClassUID) {
+          dataset._meta.MediaStorageSOPClassUID = { Value: [dataset.SOPClassUID], vr: 'UI' };
+        }
+        if (!dataset._meta.MediaStorageSOPInstanceUID && dataset.SOPInstanceUID) {
+          dataset._meta.MediaStorageSOPInstanceUID = { Value: [dataset.SOPInstanceUID], vr: 'UI' };
+        }
+        if (!dataset._meta.ImplementationClassUID) {
+          dataset._meta.ImplementationClassUID = { Value: ['1.2.840.10008.5.1.4.1.1.1'], vr: 'UI' };
+        }
+        
+        // Ensure PlanarConfiguration is set correctly for RGB images
+        if (tags.PhotometricInterpretation === 'RGB' && tags.SamplesPerPixel === 3) {
+          if (!dataset.PlanarConfiguration || dataset.PlanarConfiguration !== 0) {
+            console.log(`   Setting PlanarConfiguration to 0 (interleaved)`);
+            dataset.PlanarConfiguration = 0;
+          }
+        }
+        
+        // Denaturalize and write the corrected DICOM file
+        const denaturalizedDataset = dcmjs.data.DicomMetaDictionary.denaturalizeDataset(dataset);
+        const dicomDict = new DicomDict(denaturalizedDataset);
+        dicomDict.dict = denaturalizedDataset;
+        
+        const outputBuffer = dicomDict.write();
+        dicomBuffer = Buffer.from(outputBuffer);
+        
+        console.log(`   ✓ Transfer Syntax UID added successfully`);
+      } catch (fixErr) {
+        console.error(`   ❌ Failed to fix DICOM file: ${fixErr.message}`);
+        console.log(`   Using original file (may not render correctly)`);
       }
-    } else {
-      // Already uncompressed or unknown, use as-is
-      const { data } = await ORTHANC.get(`/instances/${instanceId}/file`, { responseType: 'arraybuffer' });
-      dicomBuffer = Buffer.from(data);
-    }
-    
-    // Validate the DICOM data
-    try {
-      const dataSet = dicomParser.parseDicom(new Uint8Array(dicomBuffer));
-      const isValid = validateDicomDimensions(dataSet);
-      if (!isValid) {
-        console.warn(`   ⚠️  DICOM validation failed - may not render correctly`);
-      }
-    } catch (parseErr) {
-      console.warn(`   ⚠️  Could not parse DICOM for validation: ${parseErr.message}`);
     }
     
     // Create multipart/related form with proper DICOMweb STOW-RS format
