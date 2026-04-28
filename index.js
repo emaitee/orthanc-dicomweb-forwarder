@@ -94,7 +94,7 @@ function writePN(group, element, str) {
  * Transfer Syntax: JPEG Baseline (1.2.840.10008.1.2.4.50)
  * This keeps file size small enough for the remote server's body limit.
  */
-async function buildJpegDicom(tags, jpegBuffer) {
+async function buildJpegDicom(tags, jpegBuffer, isGrayscale) {
   const sopClassUID   = tags.SOPClassUID   || '1.2.840.10008.5.1.4.1.1.7'; // Secondary Capture
   const sopInstanceUID = tags.SOPInstanceUID || `2.25.${Date.now()}`;
   const studyUID      = tags.StudyInstanceUID || `2.25.${Date.now()}1`;
@@ -107,6 +107,12 @@ async function buildJpegDicom(tags, jpegBuffer) {
 
   // Transfer Syntax: JPEG Baseline
   const transferSyntaxUID = '1.2.840.10008.1.2.4.50';
+
+  // For JPEG Baseline:
+  // - RGB images: SamplesPerPixel=3, PhotometricInterpretation=YBR_FULL_422
+  // - Grayscale: SamplesPerPixel=1, PhotometricInterpretation=MONOCHROME2
+  const samplesPerPixel = isGrayscale ? 1 : 3;
+  const photometric     = isGrayscale ? 'MONOCHROME2' : 'YBR_FULL_422';
 
   // ── File Meta Information ──────────────────────────────────────────────────
   const metaVersion    = writeTag(0x0002, 0x0001, 'OB', Buffer.from([0x00, 0x01]));
@@ -157,15 +163,15 @@ async function buildJpegDicom(tags, jpegBuffer) {
     writeUS(0x0020, 0x0013, parseInt(tags.InstanceNumber) || 1),
 
     // Image Pixel Module
-    writeUS(0x0028, 0x0002, 3),                    // Samples Per Pixel
-    writeCS(0x0028, 0x0004, 'YBR_FULL_422'),       // Photometric (JPEG uses YBR)
+    writeUS(0x0028, 0x0002, samplesPerPixel),      // Samples Per Pixel
+    writeCS(0x0028, 0x0004, photometric),          // Photometric Interpretation
     writeUS(0x0028, 0x0010, rows),                 // Rows
     writeUS(0x0028, 0x0011, cols),                 // Columns
     writeUS(0x0028, 0x0100, 8),                    // Bits Allocated
     writeUS(0x0028, 0x0101, 8),                    // Bits Stored
     writeUS(0x0028, 0x0102, 7),                    // High Bit
     writeUS(0x0028, 0x0103, 0),                    // Pixel Representation (unsigned)
-    writeUS(0x0028, 0x0006, 0),                    // Planar Configuration (interleaved)
+    ...(isGrayscale ? [] : [writeUS(0x0028, 0x0006, 0)]), // Planar Config only for multi-sample
   ]);
 
   // ── Pixel Data (encapsulated for compressed transfer syntax) ───────────────
@@ -262,7 +268,8 @@ async function forwardInstance(instanceId) {
     console.log(`   JPEG size: ${jpegBuffer.length} bytes (was ${pixelBuffer.length})`);
 
     // Build a complete valid DICOM file with JPEG pixel data
-    const dicomBuffer = await buildJpegDicom(tags, jpegBuffer);
+    const isGrayscale = samples === 1;
+    const dicomBuffer = await buildJpegDicom(tags, jpegBuffer, isGrayscale);
     console.log(`   DICOM file size: ${dicomBuffer.length} bytes`);
 
     // Send via STOW-RS
