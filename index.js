@@ -12,6 +12,10 @@ const STOW_URL = process.env.DICOMWEB_STOW_URL;
 const POLL_MS = parseInt(process.env.POLL_INTERVAL_MS) || 5000;
 const STATE_FILE = './last-change.txt';
 
+// Remote server body limit is ~1MB (fastify default).
+// We target 800KB for the full DICOM file to stay safely under.
+const MAX_PIXEL_BYTES = 800 * 1024;
+
 function loadLastChange() {
   try { return parseInt(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return 0; }
 }
@@ -22,20 +26,15 @@ function saveLastChange(seq) {
 
 // Write a DICOM tag in Explicit VR Little Endian format
 function writeTag(group, element, vr, valueBuffer) {
-  // Pad value to even length
   let val = valueBuffer;
   if (val.length % 2 !== 0) {
     const padByte = (vr === 'UI') ? 0x00 : 0x20;
     val = Buffer.concat([val, Buffer.from([padByte])]);
   }
-
   const tag = Buffer.alloc(4);
   tag.writeUInt16LE(group, 0);
   tag.writeUInt16LE(element, 2);
-
   const vrBuf = Buffer.from(vr, 'ascii');
-
-  // Long VRs (OB, OW, SQ, UC, UN, UR, UT) use 4-byte length with 2 reserved bytes
   const longVRs = ['OB', 'OW', 'SQ', 'UC', 'UN', 'UR', 'UT'];
   if (longVRs.includes(vr)) {
     const reserved = Buffer.alloc(2, 0);
@@ -49,177 +48,107 @@ function writeTag(group, element, vr, valueBuffer) {
   }
 }
 
-function writeUI(group, element, uid) {
-  return writeTag(group, element, 'UI', Buffer.from(uid, 'ascii'));
-}
-
-function writeUS(group, element, value) {
-  const buf = Buffer.alloc(2);
-  buf.writeUInt16LE(value, 0);
-  return writeTag(group, element, 'US', buf);
-}
-
-function writeUL(group, element, value) {
-  const buf = Buffer.alloc(4);
-  buf.writeUInt32LE(value, 0);
-  return writeTag(group, element, 'UL', buf);
-}
-
-function writeLO(group, element, str) {
-  return writeTag(group, element, 'LO', Buffer.from(str, 'ascii'));
-}
-
-function writeCS(group, element, str) {
-  return writeTag(group, element, 'CS', Buffer.from(str.trim(), 'ascii'));
-}
-
-function writeDA(group, element, str) {
-  return writeTag(group, element, 'DA', Buffer.from(str, 'ascii'));
-}
-
-function writeTM(group, element, str) {
-  return writeTag(group, element, 'TM', Buffer.from(str, 'ascii'));
-}
-
-function writeSH(group, element, str) {
-  return writeTag(group, element, 'SH', Buffer.from(str, 'ascii'));
-}
-
-function writePN(group, element, str) {
-  return writeTag(group, element, 'PN', Buffer.from(str, 'ascii'));
-}
+const writeUI = (g, e, v) => writeTag(g, e, 'UI', Buffer.from(v, 'ascii'));
+const writeUS = (g, e, v) => { const b = Buffer.alloc(2); b.writeUInt16LE(v, 0); return writeTag(g, e, 'US', b); };
+const writeUL = (g, e, v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v, 0); return writeTag(g, e, 'UL', b); };
+const writeLO = (g, e, v) => writeTag(g, e, 'LO', Buffer.from(String(v || ''), 'ascii'));
+const writeCS = (g, e, v) => writeTag(g, e, 'CS', Buffer.from(String(v || '').trim(), 'ascii'));
+const writeDA = (g, e, v) => writeTag(g, e, 'DA', Buffer.from(String(v || ''), 'ascii'));
+const writeTM = (g, e, v) => writeTag(g, e, 'TM', Buffer.from(String(v || ''), 'ascii'));
+const writeSH = (g, e, v) => writeTag(g, e, 'SH', Buffer.from(String(v || ''), 'ascii'));
+const writePN = (g, e, v) => writeTag(g, e, 'PN', Buffer.from(String(v || ''), 'ascii'));
 
 /**
- * Build a complete, valid DICOM file from scratch using JPEG-compressed pixel data.
- * Transfer Syntax: JPEG Baseline (1.2.840.10008.1.2.4.50)
- * This keeps file size small enough for the remote server's body limit.
+ * Build a complete valid DICOM file with UNCOMPRESSED pixel data.
+ * Transfer Syntax: Explicit VR Little Endian (1.2.840.10008.1.2.1)
+ *
+ * The dcmjs-org/dicomweb-server has a bug where it cannot serve encapsulated
+ * (JPEG/compressed) pixel data via WADO-RS frames endpoint - it returns ~304 bytes
+ * instead of the actual frame. Uncompressed data works correctly.
  */
-async function buildJpegDicom(tags, jpegBuffer, isGrayscale) {
-  const sopClassUID   = tags.SOPClassUID   || '1.2.840.10008.5.1.4.1.1.7'; // Secondary Capture
+function buildUncompressedDicom(tags, pixelBuffer, rows, cols, samplesPerPixel, isGrayscale) {
+  const sopClassUID    = tags.SOPClassUID    || '1.2.840.10008.5.1.4.1.1.7';
   const sopInstanceUID = tags.SOPInstanceUID || `2.25.${Date.now()}`;
-  const studyUID      = tags.StudyInstanceUID || `2.25.${Date.now()}1`;
-  const seriesUID     = tags.SeriesInstanceUID || `2.25.${Date.now()}2`;
-  const rows          = parseInt(tags.Rows);
-  const cols          = parseInt(tags.Columns);
-  const now           = new Date();
-  const dateStr       = now.toISOString().slice(0,10).replace(/-/g,'');
-  const timeStr       = now.toISOString().slice(11,19).replace(/:/g,'');
+  const studyUID       = tags.StudyInstanceUID  || `2.25.${Date.now()}1`;
+  const seriesUID      = tags.SeriesInstanceUID || `2.25.${Date.now()}2`;
+  const now            = new Date();
+  const dateStr        = now.toISOString().slice(0,10).replace(/-/g,'');
+  const timeStr        = now.toISOString().slice(11,19).replace(/:/g,'');
 
-  // Transfer Syntax: JPEG Baseline
-  const transferSyntaxUID = '1.2.840.10008.1.2.4.50';
-
-  // For JPEG Baseline:
-  // - RGB images: SamplesPerPixel=3, PhotometricInterpretation=YBR_FULL_422
-  // - Grayscale: SamplesPerPixel=1, PhotometricInterpretation=MONOCHROME2
-  const samplesPerPixel = isGrayscale ? 1 : 3;
-  const photometric     = isGrayscale ? 'MONOCHROME2' : 'YBR_FULL_422';
+  // Explicit VR Little Endian - uncompressed, works with dcmjs-org/dicomweb-server
+  const transferSyntaxUID = '1.2.840.10008.1.2.1';
+  const photometric = isGrayscale ? 'MONOCHROME2' : 'RGB';
 
   // ── File Meta Information ──────────────────────────────────────────────────
-  const metaVersion    = writeTag(0x0002, 0x0001, 'OB', Buffer.from([0x00, 0x01]));
-  const mediaSOPClass  = writeUI(0x0002, 0x0002, sopClassUID);
-  const mediaSOPInst   = writeUI(0x0002, 0x0003, sopInstanceUID);
-  const transferSyntax = writeUI(0x0002, 0x0010, transferSyntaxUID);
-  const implClassUID   = writeUI(0x0002, 0x0012, '1.2.826.0.1.3680043.2.1143.107.104.103.115');
-  const implVersion    = writeSH(0x0002, 0x0013, 'ORTHANC_FWD');
-
-  const metaContent = Buffer.concat([metaVersion, mediaSOPClass, mediaSOPInst, transferSyntax, implClassUID, implVersion]);
-
-  // (0002,0000) Group Length
-  const groupLenVal = Buffer.alloc(4);
-  groupLenVal.writeUInt32LE(metaContent.length, 0);
-  const groupLen = writeUL(0x0002, 0x0000, metaContent.length);
-
-  const fullMeta = Buffer.concat([groupLen, metaContent]);
+  const metaContent = Buffer.concat([
+    writeTag(0x0002, 0x0001, 'OB', Buffer.from([0x00, 0x01])),  // Meta Version
+    writeUI(0x0002, 0x0002, sopClassUID),                        // Media Storage SOP Class
+    writeUI(0x0002, 0x0003, sopInstanceUID),                     // Media Storage SOP Instance
+    writeUI(0x0002, 0x0010, transferSyntaxUID),                  // Transfer Syntax UID
+    writeUI(0x0002, 0x0012, '1.2.826.0.1.3680043.2.1143.107.104.103.115'), // Impl Class UID
+    writeSH(0x0002, 0x0013, 'ORTHANC_FWD'),                     // Impl Version Name
+  ]);
+  const fullMeta = Buffer.concat([
+    writeUL(0x0002, 0x0000, metaContent.length),  // Group Length
+    metaContent,
+  ]);
 
   // ── Dataset ────────────────────────────────────────────────────────────────
   const dataset = Buffer.concat([
     // Patient
-    writePN(0x0010, 0x0010, tags.PatientName  || 'Anonymous'),
-    writeLO(0x0010, 0x0020, tags.PatientID    || 'UNKNOWN'),
-    writeDA(0x0010, 0x0030, tags.PatientBirthDate || ''),
-    writeCS(0x0010, 0x0040, tags.PatientSex   || ''),
+    writePN(0x0010, 0x0010, tags.PatientName       || 'Anonymous'),
+    writeLO(0x0010, 0x0020, tags.PatientID         || 'UNKNOWN'),
+    writeDA(0x0010, 0x0030, tags.PatientBirthDate  || ''),
+    writeCS(0x0010, 0x0040, tags.PatientSex        || ''),
 
-    // Study
+    // General Study
     writeUI(0x0020, 0x000D, studyUID),
-    writeDA(0x0008, 0x0020, tags.StudyDate    || dateStr),
-    writeTM(0x0008, 0x0030, tags.StudyTime    || timeStr),
-    writeLO(0x0008, 0x1030, tags.StudyDescription || ''),
-    writeLO(0x0020, 0x0010, tags.StudyID      || '1'),
+    writeDA(0x0008, 0x0020, tags.StudyDate         || dateStr),
+    writeTM(0x0008, 0x0030, tags.StudyTime         || timeStr),
+    writeLO(0x0008, 0x1030, tags.StudyDescription  || ''),
+    writeLO(0x0020, 0x0010, tags.StudyID           || '1'),
 
-    // Series
+    // General Series
     writeUI(0x0020, 0x000E, seriesUID),
-    writeCS(0x0008, 0x0060, tags.Modality     || 'OT'),
-    writeDA(0x0008, 0x0021, tags.SeriesDate   || dateStr),
-    writeTM(0x0008, 0x0031, tags.SeriesTime   || timeStr),
+    writeCS(0x0008, 0x0060, tags.Modality          || 'OT'),
+    writeDA(0x0008, 0x0021, tags.SeriesDate        || dateStr),
+    writeTM(0x0008, 0x0031, tags.SeriesTime        || timeStr),
     writeLO(0x0008, 0x103E, tags.SeriesDescription || ''),
     writeUS(0x0020, 0x0011, parseInt(tags.SeriesNumber) || 1),
 
-    // Instance
+    // SOP Common
     writeUI(0x0008, 0x0016, sopClassUID),
     writeUI(0x0008, 0x0018, sopInstanceUID),
     writeCS(0x0008, 0x0008, 'ORIGINAL\\PRIMARY'),
-    writeDA(0x0008, 0x0023, tags.ContentDate  || dateStr),
-    writeTM(0x0008, 0x0033, tags.ContentTime  || timeStr),
+    writeDA(0x0008, 0x0023, tags.ContentDate       || dateStr),
+    writeTM(0x0008, 0x0033, tags.ContentTime       || timeStr),
     writeUS(0x0020, 0x0013, parseInt(tags.InstanceNumber) || 1),
 
-    // Image Pixel Module
-    writeUS(0x0028, 0x0002, samplesPerPixel),      // Samples Per Pixel
-    writeCS(0x0028, 0x0004, photometric),          // Photometric Interpretation
-    writeUS(0x0028, 0x0010, rows),                 // Rows
-    writeUS(0x0028, 0x0011, cols),                 // Columns
-    writeUS(0x0028, 0x0100, 8),                    // Bits Allocated
-    writeUS(0x0028, 0x0101, 8),                    // Bits Stored
-    writeUS(0x0028, 0x0102, 7),                    // High Bit
-    writeUS(0x0028, 0x0103, 0),                    // Pixel Representation (unsigned)
-    ...(isGrayscale ? [] : [writeUS(0x0028, 0x0006, 0)]), // Planar Config only for multi-sample
+    // Image Pixel Module - must exactly match the pixel buffer
+    writeUS(0x0028, 0x0002, samplesPerPixel),                    // Samples Per Pixel
+    writeCS(0x0028, 0x0004, photometric),                        // Photometric Interpretation
+    writeUS(0x0028, 0x0010, rows),                               // Rows
+    writeUS(0x0028, 0x0011, cols),                               // Columns
+    writeUS(0x0028, 0x0100, 8),                                  // Bits Allocated
+    writeUS(0x0028, 0x0101, 8),                                  // Bits Stored
+    writeUS(0x0028, 0x0102, 7),                                  // High Bit
+    writeUS(0x0028, 0x0103, 0),                                  // Pixel Representation
+    ...(isGrayscale ? [] : [writeUS(0x0028, 0x0006, 0)]),        // Planar Config (RGB only)
   ]);
 
-  // ── Pixel Data (encapsulated for compressed transfer syntax) ───────────────
-  // Encapsulated pixel data: (7FE0,0010) OB with undefined length
-  // Format: Item tag (FFFE,E000) + length + jpeg bytes, then Sequence Delimiter
-  const pixelDataTag = Buffer.alloc(4);
-  pixelDataTag.writeUInt16LE(0x7FE0, 0);
-  pixelDataTag.writeUInt16LE(0x0010, 2);
-  const pixelVR = Buffer.from('OB', 'ascii');
-  const pixelReserved = Buffer.alloc(2, 0);
-  const pixelUndefinedLen = Buffer.alloc(4, 0xFF); // 0xFFFFFFFF = undefined length
-
-  // Basic Offset Table item (empty)
-  const botTag = Buffer.alloc(4);
-  botTag.writeUInt16LE(0xFFFE, 0);
-  botTag.writeUInt16LE(0xE000, 2);
-  const botLen = Buffer.alloc(4, 0);
-
-  // JPEG fragment item
-  const fragTag = Buffer.alloc(4);
-  fragTag.writeUInt16LE(0xFFFE, 0);
-  fragTag.writeUInt16LE(0xE000, 2);
-  const fragLen = Buffer.alloc(4);
-  // Pad JPEG to even length if needed
-  let jpegPadded = jpegBuffer;
-  if (jpegBuffer.length % 2 !== 0) {
-    jpegPadded = Buffer.concat([jpegBuffer, Buffer.from([0x00])]);
+  // ── Pixel Data (OW, uncompressed, fixed length) ────────────────────────────
+  // Pad to even length
+  let pixPadded = pixelBuffer;
+  if (pixelBuffer.length % 2 !== 0) {
+    pixPadded = Buffer.concat([pixelBuffer, Buffer.from([0x00])]);
   }
-  fragLen.writeUInt32LE(jpegPadded.length, 0);
-
-  // Sequence Delimiter
-  const seqDelimTag = Buffer.alloc(4);
-  seqDelimTag.writeUInt16LE(0xFFFE, 0);
-  seqDelimTag.writeUInt16LE(0xE0DD, 2);
-  const seqDelimLen = Buffer.alloc(4, 0);
-
-  const pixelData = Buffer.concat([
-    pixelDataTag, pixelVR, pixelReserved, pixelUndefinedLen,
-    botTag, botLen,
-    fragTag, fragLen, jpegPadded,
-    seqDelimTag, seqDelimLen,
-  ]);
+  const pixelDataElement = writeTag(0x7FE0, 0x0010, 'OW', pixPadded);
 
   // ── Preamble ───────────────────────────────────────────────────────────────
   const preamble = Buffer.alloc(128, 0);
-  const magic = Buffer.from('DICM', 'ascii');
+  const magic    = Buffer.from('DICM', 'ascii');
 
-  return Buffer.concat([preamble, magic, fullMeta, dataset, pixelData]);
+  return Buffer.concat([preamble, magic, fullMeta, dataset, pixelDataElement]);
 }
 
 async function forwardInstance(instanceId) {
@@ -227,55 +156,61 @@ async function forwardInstance(instanceId) {
     console.log(`\n📋 Processing instance: ${instanceId}`);
 
     const { data: tags } = await ORTHANC.get(`/instances/${instanceId}/tags?simplify`);
-    const rows    = parseInt(tags.Rows);
-    const cols    = parseInt(tags.Columns);
-    const samples = parseInt(tags.SamplesPerPixel);
-    const bits    = parseInt(tags.BitsAllocated);
+    let rows    = parseInt(tags.Rows);
+    let cols    = parseInt(tags.Columns);
+    const samples    = parseInt(tags.SamplesPerPixel);
+    const bits       = parseInt(tags.BitsAllocated);
     const photometric = tags.PhotometricInterpretation;
+    const isGrayscale = samples === 1;
 
     console.log(`   Photometric : ${photometric}`);
     console.log(`   Dimensions  : ${rows}x${cols}`);
     console.log(`   Bits        : ${bits}  Samples: ${samples}`);
 
-    // Get raw pixel data from Orthanc (uncompressed bitmap)
+    // Get raw uncompressed pixel data from Orthanc
     const { data: pixelData } = await ORTHANC.get(
       `/instances/${instanceId}/frames/0/raw`,
       { responseType: 'arraybuffer' }
     );
-    const pixelBuffer = Buffer.from(pixelData);
+    let pixelBuffer = Buffer.from(pixelData);
     console.log(`   Raw pixel data: ${pixelBuffer.length} bytes`);
 
-    // Convert raw pixel data to JPEG using sharp
-    let jpegBuffer;
-    if (samples === 3 && photometric === 'RGB') {
-      // RGB image
-      jpegBuffer = await sharp(pixelBuffer, {
-        raw: { width: cols, height: rows, channels: 3 }
-      })
-        .jpeg({ quality: 90 })
+    // Check if we need to downscale to fit under the server's body limit
+    const rawSize = rows * cols * samples;
+    if (rawSize > MAX_PIXEL_BYTES) {
+      // Calculate scale factor to fit within limit
+      const scaleFactor = Math.sqrt(MAX_PIXEL_BYTES / rawSize);
+      const newRows = Math.floor(rows * scaleFactor / 2) * 2; // keep even
+      const newCols = Math.floor(cols * scaleFactor / 2) * 2;
+
+      console.log(`   ⚙️  Downscaling ${rows}x${cols} → ${newRows}x${newCols} to fit server limit`);
+
+      // Use sharp to resize and get raw pixel buffer
+      const sharpInput = sharp(pixelBuffer, {
+        raw: { width: cols, height: rows, channels: samples }
+      });
+
+      pixelBuffer = await sharpInput
+        .resize(newCols, newRows)
+        .raw()
         .toBuffer();
-    } else if (samples === 1) {
-      // Grayscale image
-      jpegBuffer = await sharp(pixelBuffer, {
-        raw: { width: cols, height: rows, channels: 1 }
-      })
-        .jpeg({ quality: 90 })
-        .toBuffer();
-    } else {
-      throw new Error(`Unsupported image: ${samples} samples, ${photometric}`);
+
+      rows = newRows;
+      cols = newCols;
+      console.log(`   Resized pixel data: ${pixelBuffer.length} bytes`);
     }
 
-    console.log(`   JPEG size: ${jpegBuffer.length} bytes (was ${pixelBuffer.length})`);
-
-    // Build a complete valid DICOM file with JPEG pixel data
-    const isGrayscale = samples === 1;
-    const dicomBuffer = await buildJpegDicom(tags, jpegBuffer, isGrayscale);
+    // Build complete DICOM file with uncompressed pixel data
+    const dicomBuffer = buildUncompressedDicom(tags, pixelBuffer, rows, cols, samples, isGrayscale);
     console.log(`   DICOM file size: ${dicomBuffer.length} bytes`);
 
-    // Send via STOW-RS
+    // Send via STOW-RS with proper multipart/related
     const boundary = `DICOMwebBoundary${Date.now()}`;
     const CRLF = '\r\n';
-    const partHeader = Buffer.from(`--${boundary}${CRLF}Content-Type: application/dicom${CRLF}${CRLF}`, 'utf8');
+    const partHeader = Buffer.from(
+      `--${boundary}${CRLF}Content-Type: application/dicom${CRLF}${CRLF}`,
+      'utf8'
+    );
     const partFooter = Buffer.from(`${CRLF}--${boundary}--${CRLF}`, 'utf8');
     const body = Buffer.concat([partHeader, dicomBuffer, partFooter]);
 
@@ -289,7 +224,7 @@ async function forwardInstance(instanceId) {
       maxContentLength: Infinity,
     });
 
-    console.log(`   ✅ Forwarded successfully`);
+    console.log(`   ✅ Forwarded successfully (${dicomBuffer.length} bytes)`);
     if (response.data) {
       console.log(`   Response:`, JSON.stringify(response.data).substring(0, 300));
     }
